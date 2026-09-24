@@ -72,7 +72,7 @@ def send_status(phone_number, dismisses, entries):
 
 # --- MAIL.TM ---
 MAIL_TM_BASE = "https://api.mail.tm"
-PHONE_NUMBER = "07012249321"
+PHONE_NUMBER = "07011229862"
 
 
 def create_mail_tm_account():
