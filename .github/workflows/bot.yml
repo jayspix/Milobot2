@@ -1,4 +1,4 @@
-name: Run Milo Bot
+name: Run Milo Bot2
 
 on:
   workflow_dispatch:
