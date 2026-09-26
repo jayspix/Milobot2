@@ -2,6 +2,7 @@ import random
 import re
 import time
 import threading
+import traceback
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
@@ -15,37 +16,9 @@ TELEGRAM_TOKEN = "8982012958:AAEYxhk9rbm7WcLntD41OpxADY7HW08qSDA"
 TELEGRAM_CHAT_ID = "7493468196"
 
 # --- PROXY CONFIG ---
-# Format: "IP:PORT" or "IP:PORT|type" (http, socks4, socks5)
-PROXY_LIST = [
-    "79.127.149.144:3|https",
-    "41.184.92.221:80|http",
-    "197.156.240.66:5678|socks4",
-    "105.235.201.234:32639|socks4",
-    "45.222.101.11:8080|http",
-    "41.216.169.82:5678|socks4",
-    "196.1.182.158:1080|socks4",
-    "154.113.147.1:4080|http",
-    "41.203.83.242:8080|http",
-    "196.1.182.130:1080|socks4",
-    "41.184.92.220:80|http",
-    "154.113.209.162:8082|http",
-    "102.90.0.149:8080|http",
-    "102.212.104.129:8082|http",
-    "41.75.84.86:4153|socks4",
-    "102.69.146.59:7080|socks5",
-    "188.215.31.189:10808|socks5",
-    "155.93.96.21:8080|http",
-    "102.220.189.201:8080|http",
-    "154.113.196.0:5678|socks4",
-    "79.127.149.194:443|https",
-]
-
-PROXY_TEST_URL = "https://httpbin.org/ip"
-PROXY_TIMEOUT = 7
-PROXY_MAX_THREADS = 20
-
-active_proxy = None
-proxy_lock = threading.Lock()
+# Hardcoded working proxy. Set to None to run without a proxy.
+PROXY = {"addr": "105.235.201.234:32639", "scheme": "socks4", "type": "socks4"}
+# PROXY = None
 
 # --- COUNTERS ---
 dismiss_count = 0
@@ -76,6 +49,20 @@ def send_telegram(message, parse_mode=None):
         return None
 
 
+def log(msg):
+    """Print to stdout AND send to Telegram."""
+    print(msg)
+    send_telegram(msg)
+
+
+def log_error(context, exc):
+    """Send the error + last part of the traceback to Telegram."""
+    tb = traceback.format_exc()
+    msg = f"ERROR in {context}\n{type(exc).__name__}: {exc}\n\n{tb[-1500:]}"
+    print(msg)
+    send_telegram(msg)
+
+
 def delete_telegram_message(message_id):
     try:
         requests.post(
@@ -103,116 +90,16 @@ def send_status(phone_number, dismisses, entries):
             last_status_message_id = new_id
 
 
-# --- PROXY TESTING ---
-def parse_proxy_line(line):
-    line = line.strip()
-    if not line or line.startswith("#"):
-        return None, None
-    if "|" in line:
-        parts = line.split("|")
-        addr = parts[0].strip()
-        ptype = parts[1].strip().lower()
-    else:
-        addr = line
-        ptype = "http"
-    return addr, ptype
-
-
-def test_proxy(proxy_info):
-    addr, ptype = proxy_info
-    scheme_map = {
-        "http": "http",
-        "https": "http",
-        "socks4": "socks4",
-        "socks5": "socks5",
-    }
-    scheme = scheme_map.get(ptype, "http")
-    proxy_url = f"{scheme}://{addr}"
-    proxies = {"http": proxy_url, "https": proxy_url}
-
-    start = time.time()
-    try:
-        r = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=PROXY_TIMEOUT)
-        if r.status_code == 200:
-            latency = round(time.time() - start, 2)
-            external_ip = r.json().get("origin", "unknown")
-            return {
-                "addr": addr,
-                "type": ptype,
-                "scheme": scheme,
-                "status": "WORKING",
-                "latency": latency,
-                "external_ip": external_ip,
-            }
-    except Exception:
-        pass
-
-    return {
-        "addr": addr,
-        "type": ptype,
-        "scheme": scheme,
-        "status": "FAILED",
-        "latency": None,
-        "external_ip": None,
-    }
-
-
-def test_and_pick_proxy():
-    if not PROXY_LIST:
-        print("[*] No proxies configured — running without a proxy.")
-        return None
-
-    print(f"[*] Testing {len(PROXY_LIST)} proxies...")
-    tasks = [parse_proxy_line(line) for line in PROXY_LIST]
-    tasks = [t for t in tasks if t[0]]
-
-    working = []
-    with ThreadPoolExecutor(max_workers=PROXY_MAX_THREADS) as ex:
-        futures = {ex.submit(test_proxy, t): t for t in tasks}
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res["status"] == "WORKING":
-                working.append(res)
-                print(
-                    f"  [OK] {res['addr']:<22} {res['latency']}s "
-                    f"(exit IP: {res['external_ip']})"
-                )
-            else:
-                print(f"  [--] {res['addr']:<22} failed")
-
-    if not working:
-        print("[!] No working proxies found.")
-        send_telegram("milo_bot: no working proxies found")
-        return None
-
-    best = min(working, key=lambda p: p["latency"])
-    print(
-        f"[*] Best proxy: {best['addr']} ({best['type']}, "
-        f"{best['latency']}s, exit {best['external_ip']})"
-    )
-    send_telegram(
-        f"proxy: {best['addr']} ({best['type']}, {best['latency']}s, "
-        f"exit {best['external_ip']})"
-    )
-    return best
-
-
-def refresh_proxy():
-    global active_proxy
-    best = test_and_pick_proxy()
-    with proxy_lock:
-        active_proxy = best
-    return best
-
-
 # --- MAIL.TM ---
 MAIL_TM_BASE = "https://api.mail.tm"
 PHONE_NUMBER = "07011229862"
 
 
 def create_mail_tm_account():
+    log("[mail.tm] Requesting domain list...")
     resp = requests.get(f"{MAIL_TM_BASE}/domains")
     domain = resp.json()["hydra:member"][0]["domain"]
+    log(f"[mail.tm] Domain: {domain}")
 
     username = f"user_{random.randint(10000, 99999)}"
     email = f"{username}@{domain}"
@@ -220,19 +107,21 @@ def create_mail_tm_account():
 
     payload = {"address": email, "password": password}
     headers = {"Content-Type": "application/json"}
+    log(f"[mail.tm] Creating {email} ...")
     requests.post(f"{MAIL_TM_BASE}/accounts", json=payload, headers=headers)
 
+    log("[mail.tm] Requesting token...")
     token_resp = requests.post(f"{MAIL_TM_BASE}/token", json=payload, headers=headers)
     token = token_resp.json()["token"]
 
-    print(f"Generated temporary email: {email}")
+    log(f"[mail.tm] Ready: {email}")
     return email, token
 
 
 def fetch_otp_from_mail_tm(token):
-    print("Waiting for OTP email to arrive via mail.tm...")
+    log("[OTP] Waiting for OTP email...")
     headers = {"Authorization": f"Bearer {token}"}
-    for _ in range(20):
+    for i in range(20):
         time.sleep(3)
         msg_resp = requests.get(f"{MAIL_TM_BASE}/messages", headers=headers)
         messages = msg_resp.json().get("hydra:member", [])
@@ -242,12 +131,13 @@ def fetch_otp_from_mail_tm(token):
                 f"{MAIL_TM_BASE}/messages/{msg_id}", headers=headers
             ).json()
             text_content = full_msg.get("text", "") or full_msg.get("intro", "")
-            print("Email content retrieved successfully.")
             digits = re.findall(r"\b\d{4,6}\b", text_content)
             if digits:
                 otp = digits[0]
-                print(f"Extracted OTP: {otp}")
+                log(f"[OTP] Extracted: {otp}")
                 return otp
+        if i % 5 == 0:
+            log(f"[OTP] Still waiting... ({i * 3}s)")
     raise Exception("Timeout: OTP email did not arrive in time.")
 
 
@@ -263,7 +153,7 @@ def try_click_dismiss(driver, timeout=5):
             el.click()
         except Exception:
             driver.execute_script("arguments[0].click();", el)
-        print("Dismiss button clicked.")
+        log("[Dismiss] Clicked.")
         with count_lock:
             dismiss_count += 1
             d = dismiss_count
@@ -271,31 +161,29 @@ def try_click_dismiss(driver, timeout=5):
         send_status(PHONE_NUMBER, d, e)
         return True
     except Exception:
-        print("Dismiss button not present — skipping.")
+        log("[Dismiss] Button not present — skipping.")
         return False
 
 
-send_telegram("milo_bot started.")
-
-# Pick the best proxy once at startup
-refresh_proxy()
+log("milo_bot started.")
+if PROXY:
+    log(f"[proxy] Using {PROXY['scheme']}://{PROXY['addr']}")
+else:
+    log("[proxy] Running without a proxy")
 
 
 # --- MAIN LOOP ---
 entry_number = 1
 while True:
-    print(f"\n=== Starting entry #{entry_number} ===")
+    log(f"=== Starting entry #{entry_number} ===")
 
     try:
         temp_email, mail_token = create_mail_tm_account()
     except Exception as e:
-        print(f"Could not create temp email: {type(e).__name__}: {e}")
+        log_error("create_mail_tm_account", e)
         time.sleep(5)
         entry_number += 1
         continue
-
-    with proxy_lock:
-        current_proxy = active_proxy
 
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -306,19 +194,29 @@ while True:
     chrome_options.binary_location = (
         "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome"
     )
-
-    if current_proxy:
+    if PROXY:
         chrome_options.add_argument(
-            f"--proxy-server={current_proxy['scheme']}://{current_proxy['addr']}"
+            f"--proxy-server={PROXY['scheme']}://{PROXY['addr']}"
         )
 
-    driver = webdriver.Chrome(options=chrome_options)
+    log("[chrome] Launching browser...")
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(30)
+    except Exception as e:
+        log_error("webdriver.Chrome launch", e)
+        entry_number += 1
+        continue
+
     wait = WebDriverWait(driver, 20)
 
-    proxy_failed = False
     try:
+        log("[nav] Opening target URL...")
         driver.get("https://milotextandwinpromo.com.ng/")
+        log(f"[nav] Title: {driver.title}")
+        log(f"[nav] URL: {driver.current_url}")
 
+        log("[form] Filling phone...")
         phone_input = wait.until(
             EC.presence_of_element_located(
                 (By.XPATH, "/html/body/main/div/div[2]/div[2]/form/div[1]/div/input")
@@ -326,11 +224,13 @@ while True:
         )
         phone_input.send_keys(PHONE_NUMBER)
 
+        log("[form] Filling email...")
         email_input = driver.find_element(
             By.XPATH, "/html/body/main/div/div[2]/div[2]/form/div[2]/div/input"
         )
         email_input.send_keys(temp_email)
 
+        log("[form] Clicking proceed (step 1)...")
         proceed_btn_1 = driver.find_element(
             By.XPATH, "/html/body/main/div/div[2]/div[2]/form/button"
         )
@@ -338,6 +238,7 @@ while True:
 
         otp_code = fetch_otp_from_mail_tm(mail_token)
 
+        log("[form] Entering OTP...")
         otp_field = wait.until(
             EC.presence_of_element_located(
                 (By.XPATH, "/html/body/div[4]/div/div/form/div/div/div/input[1]")
@@ -345,11 +246,13 @@ while True:
         )
         otp_field.send_keys(otp_code)
 
+        log("[form] Clicking proceed (OTP modal)...")
         proceed_btn_2 = driver.find_element(
             By.XPATH, "/html/body/div[4]/div/div/form/button"
         )
         proceed_btn_2.click()
 
+        log("[form] Filling first name...")
         first_name_input = wait.until(
             EC.presence_of_element_located(
                 (By.XPATH, "/html/body/main/div/div[2]/div[2]/form/div[1]/div[1]/div/input")
@@ -357,16 +260,19 @@ while True:
         )
         first_name_input.send_keys("david")
 
+        log("[form] Filling last name...")
         last_name_input = driver.find_element(
             By.XPATH, "/html/body/main/div/div[2]/div[2]/form/div[1]/div[2]/div/input"
         )
         last_name_input.send_keys("danjuma")
 
+        log("[form] Opening state dropdown...")
         dropdown_btn = driver.find_element(
             By.XPATH, "/html/body/main/div/div[2]/div[2]/form/div[2]/button/div"
         )
         dropdown_btn.click()
 
+        log("[form] Selecting state...")
         state_option = wait.until(
             EC.element_to_be_clickable(
                 (By.XPATH, "/html/body/div[3]/div/div/div/div/div/div/div[1]/div")
@@ -375,37 +281,31 @@ while True:
         state_option.click()
 
         random_9_digit = str(random.randint(100000000, 999999987))
+        log(f"[form] Promo code: {random_9_digit}")
         promo_input = driver.find_element(
             By.XPATH, "/html/body/main/div/div[2]/div[2]/form/div[3]/div/input"
         )
         promo_input.send_keys(random_9_digit)
-        print(f"Generated and entered promo code: {random_9_digit}")
 
+        log("[form] Clicking enter promo...")
         enter_promo_btn = driver.find_element(
             By.XPATH, "/html/body/main/div/div[2]/div[2]/form/button"
         )
         driver.execute_script("arguments[0].click();", enter_promo_btn)
-        print("Automation sequence completed successfully!")
+        log("[form] Promo submitted.")
 
         time.sleep(3)
         try_click_dismiss(driver)
 
     except Exception as e:
-        msg = str(e).lower()
-        if any(k in msg for k in ("proxy", "net::err", "err_proxy", "err_tunnel")):
-            proxy_failed = True
-        print(f"Entry #{entry_number} failed: {type(e).__name__}: {e}")
+        log_error(f"entry #{entry_number} flow", e)
 
     finally:
         driver.quit()
 
-    if proxy_failed:
-        print("[*] Proxy appears dead — re-testing all proxies...")
-        refresh_proxy()
-
     with count_lock:
         entry_count += 1
 
-    print("1 entry")
+    log(f"[done] Entry #{entry_number} finished. Total entries: {entry_count}")
     entry_number += 1
     time.sleep(2)
