@@ -3,9 +3,9 @@ import re
 import time
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -13,6 +13,20 @@ from selenium.webdriver.support.ui import WebDriverWait
 # --- TELEGRAM CONFIG ---
 TELEGRAM_TOKEN = "8982012958:AAEYxhk9rbm7WcLntD41OpxADY7HW08qSDA"
 TELEGRAM_CHAT_ID = "7493468196"
+
+# --- PROXY CONFIG ---
+# Format: "IP:PORT" or "IP:PORT|type" (http, socks4, socks5)
+PROXY_LIST = [
+    # "1.2.3.4:8080",
+    # "5.6.7.8:1080|socks5",
+]
+
+PROXY_TEST_URL = "https://httpbin.org/ip"
+PROXY_TIMEOUT = 7
+PROXY_MAX_THREADS = 20
+
+active_proxy = None
+proxy_lock = threading.Lock()
 
 # --- COUNTERS ---
 dismiss_count = 0
@@ -68,6 +82,108 @@ def send_status(phone_number, dismisses, entries):
         new_id = send_telegram(text, parse_mode="HTML")
         if new_id:
             last_status_message_id = new_id
+
+
+# --- PROXY TESTING ---
+def parse_proxy_line(line):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None, None
+    if "|" in line:
+        parts = line.split("|")
+        addr = parts[0].strip()
+        ptype = parts[1].strip().lower()
+    else:
+        addr = line
+        ptype = "http"
+    return addr, ptype
+
+
+def test_proxy(proxy_info):
+    addr, ptype = proxy_info
+    scheme_map = {
+        "http": "http",
+        "https": "http",
+        "socks4": "socks4",
+        "socks5": "socks5",
+    }
+    scheme = scheme_map.get(ptype, "http")
+    proxy_url = f"{scheme}://{addr}"
+    proxies = {"http": proxy_url, "https": proxy_url}
+
+    start = time.time()
+    try:
+        r = requests.get(PROXY_TEST_URL, proxies=proxies, timeout=PROXY_TIMEOUT)
+        if r.status_code == 200:
+            latency = round(time.time() - start, 2)
+            external_ip = r.json().get("origin", "unknown")
+            return {
+                "addr": addr,
+                "type": ptype,
+                "scheme": scheme,
+                "status": "WORKING",
+                "latency": latency,
+                "external_ip": external_ip,
+            }
+    except Exception:
+        pass
+
+    return {
+        "addr": addr,
+        "type": ptype,
+        "scheme": scheme,
+        "status": "FAILED",
+        "latency": None,
+        "external_ip": None,
+    }
+
+
+def test_and_pick_proxy():
+    if not PROXY_LIST:
+        print("[*] No proxies configured — running without a proxy.")
+        return None
+
+    print(f"[*] Testing {len(PROXY_LIST)} proxies...")
+    tasks = [parse_proxy_line(line) for line in PROXY_LIST]
+    tasks = [t for t in tasks if t[0]]
+
+    working = []
+    with ThreadPoolExecutor(max_workers=PROXY_MAX_THREADS) as ex:
+        futures = {ex.submit(test_proxy, t): t for t in tasks}
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res["status"] == "WORKING":
+                working.append(res)
+                print(
+                    f"  [OK] {res['addr']:<22} {res['latency']}s "
+                    f"(exit IP: {res['external_ip']})"
+                )
+            else:
+                print(f"  [--] {res['addr']:<22} failed")
+
+    if not working:
+        print("[!] No working proxies found.")
+        send_telegram("milo_bot: no working proxies found")
+        return None
+
+    best = min(working, key=lambda p: p["latency"])
+    print(
+        f"[*] Best proxy: {best['addr']} ({best['type']}, "
+        f"{best['latency']}s, exit {best['external_ip']})"
+    )
+    send_telegram(
+        f"proxy: {best['addr']} ({best['type']}, {best['latency']}s, "
+        f"exit {best['external_ip']})"
+    )
+    return best
+
+
+def refresh_proxy():
+    global active_proxy
+    best = test_and_pick_proxy()
+    with proxy_lock:
+        active_proxy = best
+    return best
 
 
 # --- MAIL.TM ---
@@ -140,19 +256,10 @@ def try_click_dismiss(driver, timeout=5):
         return False
 
 
-def report_loop():
-    while True:
-        time.sleep(600)
-        with count_lock:
-            d = dismiss_count
-            e = entry_count
-        pct = (d / e * 100) if e else 0
-        send_status(PHONE_NUMBER, d, e)
-        send_telegram(f"periodic: {d}/{e} ({pct:.1f}%)")
-
-
-threading.Thread(target=report_loop, daemon=True).start()
 send_telegram("milo_bot started.")
+
+# Pick the best proxy once at startup
+refresh_proxy()
 
 
 # --- MAIN LOOP ---
@@ -168,19 +275,28 @@ while True:
         entry_number += 1
         continue
 
+    with proxy_lock:
+        current_proxy = active_proxy
+
     chrome_options = Options()
-    # Headless mode (required — GitHub's runner has no display)
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
-    # Point at the Chrome binary that browser-actions/setup-chrome installs
-    chrome_options.binary_location = "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome"
+    chrome_options.binary_location = (
+        "/opt/hostedtoolcache/setup-chrome/chromium/stable/x64/chrome"
+    )
+
+    if current_proxy:
+        chrome_options.add_argument(
+            f"--proxy-server={current_proxy['scheme']}://{current_proxy['addr']}"
+        )
 
     driver = webdriver.Chrome(options=chrome_options)
     wait = WebDriverWait(driver, 20)
 
+    proxy_failed = False
     try:
         driver.get("https://milotextandwinpromo.com.ng/")
 
@@ -256,10 +372,17 @@ while True:
         try_click_dismiss(driver)
 
     except Exception as e:
+        msg = str(e).lower()
+        if any(k in msg for k in ("proxy", "net::err", "err_proxy", "err_tunnel")):
+            proxy_failed = True
         print(f"Entry #{entry_number} failed: {type(e).__name__}: {e}")
 
     finally:
         driver.quit()
+
+    if proxy_failed:
+        print("[*] Proxy appears dead — re-testing all proxies...")
+        refresh_proxy()
 
     with count_lock:
         entry_count += 1
